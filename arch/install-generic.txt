@@ -1,0 +1,332 @@
+# This document is meant to assist in installing Arch Linux using LVM-on-LUKS. It is not a script. While you can type these commands directly on the console, it is much easier to connect by SSH where they can be copy+pasted. sshd is already running and configued to allow login by root. If connecting by WiFi, follow the on screen instructions to connect your computer. That is not covered by this procedure.
+
+# Set the root password for the install environment.
+passwd
+
+# Find the IP of the network interface.
+ip addr
+
+# Increase cowspace to use half of the system RAM in order to install a utility without running out of space.
+mount -o remount,size=50% /run/archiso/cowspace
+
+# If your keyboard is does not have the standard US layout, then load the layout now. The JIS layout is used an example.
+loadkeys jp106
+
+# Make sure the system clock is set.
+timedatectl set-ntp true
+
+## The following sets some variables that will make copy+paste of command easier.
+
+# Identify the block device you want to install on.
+lsblk
+
+# Define the target block device. An NVMe device is used as an example. Change to your actual device.
+TARGET=/dev/nvme0n1
+
+# Defile the boot partition. It will be added as the suffix to the traget device name. For NVMe devices, it is "p" followed by a number. For SATA devices, it is just a number. Change these values to the actual partition numbers.
+# Boot partion
+BPART=p1
+
+# Partition root will be installed on
+RPART=p2
+
+# If a swap partition is desired, set its size here.
+SWAPSIZE=64G
+
+# Define the CPU maker, either intel or amd.
+CPUMAKER=intel
+
+## Partition the disks. This will use parted to create two paritions. An ESP FAT32 parition for boot/EFT with a size of 512MB, and the remainder of the disk for the LVM-on-LUKS
+parted -a optimal $TARGET
+mklabel gpt
+mkpart primary fat32 0% 512MiB
+set 1 ESP on
+mkpart primary 512MiB 100%
+quit
+
+# Verify the paritions were created by looking at the output of lsblk
+lsblk
+
+# Format the ESP partition
+mkfs.vfat -F32 "$TARGET""$BPART"
+
+## Create the LUKS container. Serpent is the block cipher, and whirlpool as the user key hashing function. These suggestions were taken from the Gentoo install guide by Sakaki.
+cryptsetup --cipher serpent-xts-plain64 --key-size 512 --hash whirlpool luksFormat "$TARGET""$RPART"
+
+# Open the LUKS container
+cryptsetup luksOpen "$TARGET""$RPART" arch
+
+## Create the LVM structure in the LUKS container
+pvcreate /dev/mapper/arch
+
+# Creat the volume group called arch01
+vgcreate arch01 /dev/mapper/arch
+
+## Create the logical volumes (LV) in the volume group
+# If a swap is desired (suggested), create it now
+lvcreate --size "$SWAPSIZE" --name swap arch01
+
+# Fill the remaining space in the volume group with the root LV. You can create other logical volumes for home, usr, var, etc if so desired.
+lvcreate --extents 100%FREE --name root arch01
+
+# Make the VG available for use.
+vgchange --available y
+
+# Establish the files systems in the LVs.
+# Swap
+mkswap -L "swap" /dev/mapper/arch01-swap
+
+# EXT4 for root
+mkfs.ext4 -L "root" /dev/mapper/arch01-root
+
+# Turn on the swap
+swapon -v /dev/mapper/arch01-swap
+
+# Make a directory to hold the arch install.
+mkdir /mnt/arch
+
+# Mount the root LV to that directory
+mount -v -t ext4 /dev/mapper/arch01-root /mnt/arch
+
+# Creat and mount the boot parition.
+mkdir /mnt/arch/boot
+mount -v -t vfat "$TARGET""$BPART" /mnt/arch/boot
+
+## Install base system
+
+# Install the pacman-contrib package to provide a script called rankmirrors to recreate the list of arch repository mirrors and rank them based on their ping.
+pacman -Sy pacman-contrib
+
+# Remove the current list of pacman mirrors
+rm /etc/pacman.d/mirrorlist
+
+# Use rankmirror to create the list. This URL will fetch a list of servers in the US that us HTTPS, IPv4 and 6, and have mirror status set to on. After some sed magic, the list is piped into the rankmirrors script, and the output is written to a new mirrorlist file.
+curl -s "https://archlinux.org/mirrorlist/?country=US&protocol=https&ip_version=4&ip_version=6&use_mirror_status=on" | sed -e 's/^#Server/Server/' -e '/^#/d' | rankmirrors -n 10 - > /etc/pacman.d/mirrorlist
+
+# Bootstrap a basic arch installation. This will install the following packages. The required ones are marked
+# "$CPUMAKER"-ucode (Processor microcode files) [REQUIRED]
+# base (Minimal package set to define a basic Arch Linux installation) [REQUIRED]
+# base-devel (base development packages, compilers and such)
+# cronie (for cron) 
+# dkms (Dynamic Kernel Modules System)
+# git (the fast distributed version control system)
+# htop (Interactive process viewer)
+# linux (The Linux kernel and modules) [REQUIRED]
+# linux-lts (The LTS Linux kernel and modules)
+# linux-firmware (Firmware files for Linux) [REQUIRED]
+# linux-headers (Headers and scripts for building modules for the Linux kernel)
+# linux-lts-headers (Headers and scripts for building modules for the LTS Linux kernel)
+# lsof (Lists open files for running Unix processes)
+# lvm2 (Logical Volume Manager 2 utilities) [REQUIRED]
+# nano (Pico editor clone with enhancements)
+# networkmanager (Network connection manager and user applications)
+# openssh (SSH protocol implementation for remote login, command execution and file transfer)
+# sudo (Give certain users the ability to run some commands as root)
+# vim (Vi Improved, a highly configurable, improved version of the vi text editor)
+# wget (Network utility to retrieve files from the Web)
+# zsh (A very advanced and programmable command interpreter (shell) for UNIX)
+
+pacstrap /mnt/arch "$CPUMAKER"-ucode base base-devel cronie dkms git htop linux linux-lts linux-firmware linux-headers linux-lts-headers lsof lvm2 nano networkmanager openssh sudo vim wget zsh
+
+# Automatically generate the /etc/fstab file for your installation
+genfstab -U /mnt/arch >> /mnt/arch/etc/fstab
+
+## Complete install
+
+# Chroot into the new installation to begin making and editing configuration files.
+arch-chroot /mnt/arch
+
+# Set the timezone for the system. US Central time is used as an example.
+ln -sf /usr/share/zoneinfo/America/Chicago /etc/localtime
+
+# The following sets the hardware clock from the system clock.
+hwclock --systohc
+
+# Edit the list of locales you want to generate. At least one UTF-8 locale should be uncommented.
+nano -w /etc/locale.gen
+
+# Generate the selected locales
+locale-gen
+
+# Set the desired system langauge. EN (US) UTF-8 is used as an example.
+echo "LANG=en_US.UTF-8" > /etc/locale.conf && cat /etc/locale.conf
+
+# Set the keyboard layout and a reasonable console font. US layout used as an example.
+echo -e "KEYMAP=us\nFONT=lat1-16\nFONT_MAP=8859-1_to_uni" > /etc/vconsole.conf && cat /etc/vconsole.conf
+
+# Set this variable for your desired system hostname. Hyrule is used as an example.
+HSTNAME=hyrule
+
+# Create the hostname file
+echo $HSTNAME > /etc/hostname && cat /etc/hostname
+
+# Create a basic hosts file.
+echo -e "127.0.0.1 \t$HSTNAME \tlocalhost\n::1 \t$HSTNAME \tlocalhost\n127.0.1.1 \t$HSTNAME.localdomain \t$HSTNAME" > /etc/hosts && cat /etc/hosts
+
+## Make some changes to the pacman configuration.
+# For fun
+sed '/Color/s/^#//' -i /etc/pacman.conf
+
+# Parallel downloads
+sed '/ParallelDownloads/s/^#//' -i /etc/pacman.conf
+
+## Bootloader
+# Install systemd-boot
+bootctl --path=/boot install
+
+# Edit the configuration file
+cd /boot/loader
+
+# This sets arch to boot the mainline kernel as default after a 15 second time out, and disables editing the boot options from the boot loader. Feel free to changes these options as you desire.
+echo -e "default \tarch.conf\ntimeout \t15\nconsole-mode \tmax\neditor \t\tno" > loader.conf && cat loader.conf
+
+
+# Create the menu entries for the mainline kernel and the LTS kernel.
+cd entries
+
+# Determine the UUID of the partition holding the LUKS container. In the examples used in this doctument, it would be /dev/nvme0n1p2. Save this ID for use in the config files below.
+blkid /dev/nvme0n1p2
+
+# Linux mainline kernel entry. Replace <CPUMAKER> with either intel or amd. Replace <UUID> with the ID obtained from blkid above.
+# If there is no swap, then remove "rd.lvm.lv=arch01/swap" and "resume=/dev/mapper/arch01-swap"
+# If you have swap but it is not large enough to accomodate hiberation, then remove "resume=/dev/mapper/arch01-swap"
+# If TRIM of NVMe/SSD is not desired, remove "rd.luks.allow-discards"
+# If this is a laptop, then it might be desirable to add "mem_sleep_default=deep" to the options line for longer battery life when in sleep/suspend.
+# To reduce the amount of boot messages add "quiet"
+# For a splash screen such as Plymouth, add "splash"
+
+nano /boot/loader/entries/arch.conf
+
+title 	Arch Linux
+linux 	/vmlinuz-linux
+initrd 	/<CPUMAKER>-ucode.img
+initrd 	/initramfs-linux.img
+options rd.luks.uuid=luks-<UUID> rd.lvm.lv=arch01/root rd.lvm.lv=arch01/swap root=/dev/mapper/arch01-root rootfstype=ext4 rootflags=rw,relatime resume=/dev/mapper/arch01-swap rd.luks.allow-discards
+
+# LTS Linux kernel entry
+# Same as above
+
+nano /boot/loader/entries/arch-lts.conf
+
+title 	Arch Linux LTS
+linux 	/vmlinuz-linux-lts
+initrd 	/intel-ucode.img
+initrd 	/initramfs-linux-lts.img
+options rd.luks.uuid=luks-<UUID> rd.lvm.lv=arch01/root rd.lvm.lv=arch01/swap root=/dev/mapper/arch01-root rootfstype=ext4 rootflags=rw,relatime resume=/dev/mapper/arch01-swap rd.luks.allow-discards
+
+# Change directory back to root
+cd /
+
+## Configure the initramfs
+# For Intel GPU
+sed -i '/^#/!s/MODULES=.*/MODULES=(i915)/g' /etc/mkinitcpio.conf
+
+# For AMD GPUT
+sed -i '/^#/!s/MODULES=.*/MODULES=(amdgpu)/g' /etc/mkinitcpio.conf
+
+## Configure the initramfs hooks
+# If you did not configure a resume device in the bootloader entry config, remove "resume" from the list of hooks.
+sed -i  '/^#/!s/HOOKS=.*/HOOKS=(base systemd autodetect keymap keyboard sd-vconsole modconf block sd-encrypt lvm2 filesystems resume fsck)/g' /etc/mkinitcpio.conf && cat /etc/mkinitcpio.conf
+
+# Regenerate the initramfs
+mkinitcpio -P
+
+# Set the root password
+passwd
+
+## Add user
+# In this example, the user, link, is added to wheel (for sudo access), input and video (to control things like display backlight brightness), is going to use zsh as the shell (bash is also installed by default). Alter these values for your users.
+useradd -m -G wheel,input,video -s /usr/bin/zsh --comment "Link" link
+
+# Set the password for the created user. Again, link is used as an example.
+passwd link
+
+# Configure sudo options, if desired
+export EDITOR=nano; visudo
+
+# Config systemd-timesyncd
+sed '/NTP/s/^#//' -i /etc/systemd/timesyncd.conf
+sed '/FallbackNTP/s/^#//' -i /etc/systemd/timesyncd.conf
+
+# Enable system daemons. Adjust these to match what has been installed on the system.
+systemctl enable cronie NetworkManager systemd-timesyncd sshd
+
+## Reboot the system
+# Exit the chroot environment
+exit
+
+# Flush any data that needs to be written to disk.
+sync
+
+# Unmount all paritions used for the installation
+umount -R /mnt/arch
+
+# Turn off swap
+swapoff -v /dev/mapper/arch01-swap
+
+# Turn off the VGs
+vgchange --available n
+
+# Close the LUKS container
+cryptsetup luksClose arch
+
+# Reboot the system
+systemctl reboot
+
+# Remove the arch install USB. The system should now boot into a functional Arch Linux installation. 
+
+# At a minimum, it is suggested to install the xorg pacakge.
+sudo pacman -Syu xorg
+
+# After that is done, configure some locale options
+sudo localectl set-locale LANG="${LANG}" LC_COLLATE="C"
+
+# Set your keyboard layout. US layout used as an example.
+sudo localectl set-keymap us
+sudo localectl --no-convert set-x11-keymap us
+
+# If you have an NVMe/SSD it is suggested to regularly do TRIM garbage collection. Enable the system timer to do this.
+sudo systemctl enable fstrim.timer
+
+# To have your pacman mirrorlist regularly updated automatically edit the config file, and then enable the system timer.
+sudo nano /etc/xdg/reflector/reflector.conf
+sudo systemctl enable reflector.timer
+
+# To have your disks SMART status monitored, install the smartmonctl package, and enable the system service.
+sudo pacman -Syu smartmonctl
+sudo systemctl enable smartd
+
+## From here pacman can be used to install any desired software. What is below are some suggestions.
+
+# Utilizing multiple cores on compression when building packages from the AUR or your own packages.
+sudo sed -i 's/COMPRESSGZ=(gzip -c -f -n)/COMPRESSGZ=(pigz -c -f -n)/g' /etc/makepkg.conf && sudo sed -i 's/COMPRESSXZ=(xz -c -z -)/COMPRESSXZ=(xz -c -z - --threads=0)/g' /etc/makepkg.conf && sudo sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q - --threads=0)/g' /etc/makepkg.conf && sudo sed -i 's/COMPRESSBZ2=(bzip2 -c -f)/COMPRESSBZ2=(pbzip2 -c -f)/g' /etc/makepkg.conf
+
+## To use software from the AUR, a helper must be installed. I prefer a helper called aurman. It is basically a drop in replacement for pacman in most normal cases.
+# Clone the repository in /tmp so it's deleted on the next reboot as it is not needed.
+cd /tmp
+
+# Clone the repository and install the package.
+git clone https://aur.archlinux.org/aurman.git
+cd aurman
+gpg --receive-keys 465022E743D71E39
+makepkg -si
+
+## Install and enable a Plymouth splash screen
+aurman -Syu plymouth-git
+
+# Modify the initramfs to use Plymouth.
+nano /etc/mkinitcpio.conf
+
+# Add the sd-plymouth hook after systemd.
+HOOKS=(base systemd sd-plymouth autodetect keymap keyboard sd-vconsole modconf block sd-encrypt lvm2 filesystems resume fsck)
+
+# The default theme is spinner. The Arch logo can be added.
+sudo cp /usr/share/plymouth/arch-logo.png /usr/share/plymouth/themes/spinner/watermark.png
+
+# Remake the initramfs
+sudo mkinitcpio -P
+
+# When enabling a DM, many of them have a plymouth version of the service file. A notable exception is GDM. See the Plymouth article in the Arch Wiki for more information.
+
+# Reboot
+sudo systemctl reboot
